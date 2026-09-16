@@ -55,6 +55,7 @@ AUTH_HINTS = {
     56: "Доступ к API не выдан — подайте заявку в кабинете Директа",
     58: "Токен не подходит для режима (sandbox/prod) — проверьте mode.sandbox",
 }
+RATE_LIMIT_STATUS_CODE = 429
 PLACEHOLDER_TOKENS = {
     "", "your_oauth_token_here", "changeme", "token", "put_your_token_here",
 }
@@ -65,16 +66,28 @@ PLACEHOLDER_TOKENS = {
 # =============================================================================
 
 class DirectApiError(Exception):
-    def __init__(self, code: int, message: str, details: str = "", request_id: str | None = None):
+    def __init__(
+        self,
+        code: int,
+        message: str,
+        details: str = "",
+        request_id: str | None = None,
+        retry_after: int | None = None,
+    ):
         super().__init__(f"[{code}] {message} {details}".strip())
         self.code = code
         self.message = message
         self.details = details
         self.request_id = request_id
+        self.retry_after = retry_after
 
     @property
     def is_auth_error(self) -> bool:
         return self.code in AUTH_ERROR_CODES
+
+    @property
+    def is_rate_limit_error(self) -> bool:
+        return self.code == RATE_LIMIT_STATUS_CODE
 
     @property
     def hint(self) -> str | None:
@@ -548,6 +561,24 @@ class DirectClient:
             self.session.headers["Client-Login"] = settings.client_login
         self._semaphore = threading.Semaphore(settings.max_concurrent)
         self.last_units: dict[str, int] = {}
+        self._units_limit_reached = False
+
+    def check_units_limit(self) -> tuple[bool, int | None]:
+        """
+        Проверяет, не достигнут ли лимит единиц API.
+        Возвращает (is_limit_reached, units_rest).
+        """
+        units_limit = self.last_units.get("Units-Limit")
+        units_rest = self.last_units.get("Units-Rest")
+        
+        if units_limit is None or units_rest is None:
+            return False, None
+        
+        # Если осталось меньше 10% единиц, считаем что лимит близок
+        threshold = max(1, units_limit // 10)
+        is_near_limit = units_rest <= threshold
+        
+        return is_near_limit, units_rest
 
     def _do_post(self, service: str, payload: dict[str, Any]) -> dict[str, Any]:
         url = f"{self.settings.api_base}/{service}"
@@ -555,6 +586,7 @@ class DirectClient:
         with self._semaphore:
             response = self.session.post(url, json=payload, timeout=self.settings.request_timeout)
 
+        # Чтение заголовков лимитов API
         for header in ("Units", "Units-Used", "Units-Rest", "Units-Limit"):
             value = response.headers.get(header)
             if value is None:
@@ -563,6 +595,22 @@ class DirectClient:
                 self.last_units[header] = int(value)
             except ValueError:
                 pass
+
+        # Проверка на превышение лимита запросов (429 Too Many Requests)
+        if response.status_code == RATE_LIMIT_STATUS_CODE:
+            retry_after = None
+            retry_after_header = response.headers.get("Retry-After")
+            if retry_after_header:
+                try:
+                    retry_after = int(retry_after_header)
+                except ValueError:
+                    pass
+            raise DirectApiError(
+                code=RATE_LIMIT_STATUS_CODE,
+                message="Превышен лимит запросов (Too Many Requests)",
+                details=f"Retry-After: {retry_after}",
+                retry_after=retry_after,
+            )
 
         if response.status_code >= 500:
             raise requests.RequestException(
@@ -590,11 +638,49 @@ class DirectClient:
             reraise=True,
             stop=stop_after_attempt(self.settings.retry_count),
             wait=wait_exponential(multiplier=1, min=1, max=10),
-            retry=retry_if_exception_type(requests.RequestException),
+            retry=retry_if_exception_type((requests.RequestException, DirectApiError)),
         )
         def _wrapped() -> dict[str, Any]:
             return self._do_post(service, payload)
         return _wrapped()
+
+    def _request_with_pagination(
+        self,
+        service: str,
+        method: str,
+        selection_criteria: dict[str, Any],
+        field_names: list[str],
+    ) -> list[dict[str, Any]]:
+        """Выполняет запрос с поддержкой пагинации (Offset/Limit)."""
+        all_results: list[dict[str, Any]] = []
+        limit = self.settings.max_keywords_per_batch
+        offset = 0
+
+        while True:
+            payload = {
+                "method": method,
+                "params": {
+                    "SelectionCriteria": selection_criteria,
+                    "FieldNames": field_names,
+                    "Limit": limit,
+                    "Offset": offset,
+                },
+            }
+            data = self._request(service, payload)
+            items = data.get("result", {}).get(method == "get" and service in ("keywords", "bids", "ads", "adgroups", "campaigns") and {"keywords": "Keywords", "bids": "Bids", "ads": "Ads", "adgroups": "AdGroups", "campaigns": "Campaigns"}.get(service, "Items") or "Items", [])
+            
+            if not items:
+                break
+            
+            all_results.extend(items)
+            
+            if len(items) < limit:
+                break
+            
+            offset += limit
+            logger.debug(f"Пагинация: получено {len(items)}, продолжаем с offset={offset}")
+
+        return all_results
 
     def check_campaigns(self, timestamp: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {"method": "checkCampaigns", "params": {}}
@@ -603,18 +689,17 @@ class DirectClient:
         return self._request("changes", payload)
 
     def get_bids(self, campaign_id: int) -> list[dict[str, Any]]:
-        payload = {
-            "method": "get",
-            "params": {
-                "SelectionCriteria": {"CampaignIds": [campaign_id]},
-                "FieldNames": ["KeywordId", "Bid", "ContextBid"],
-            },
-        }
-        return self._request("bids", payload).get("result", {}).get("Bids", [])
+        """Получает ставки для кампании с поддержкой пагинации."""
+        selection_criteria = {"CampaignIds": [campaign_id]}
+        field_names = ["KeywordId", "Bid", "ContextBid"]
+        
+        # Используем пагинацию для получения всех ставок
+        return self._request_with_pagination("bids", "get", selection_criteria, field_names)
 
     def get_auction_prices(self, keyword_ids: list[int]) -> dict[int, Decimal | None]:
         result: dict[int, Decimal | None] = {}
         batch = self.settings.max_keywords_per_batch
+        
         for start in range(0, len(keyword_ids), batch):
             chunk = keyword_ids[start:start + batch]
             payload = {
@@ -625,7 +710,18 @@ class DirectClient:
                 },
             }
             data = self._request("keywords", payload)
-            for item in data.get("result", {}).get("Keywords", []):
+            
+            # Валидация ответа API
+            result_data = data.get("result")
+            if result_data is None:
+                logger.warning(f"get_auction_prices: пустой результат для чанка {chunk[:5]}...")
+                continue
+                
+            keywords = result_data.get("Keywords", [])
+            for item in keywords:
+                if "Id" not in item:
+                    logger.warning(f"get_auction_prices: отсутствует поле Id в элементе {item}")
+                    continue
                 kw_id = int(item["Id"])
                 raw = item.get("PremiumEntryPrice")
                 result[kw_id] = None if raw is None else Decimal(raw) / BID_MULTIPLIER
@@ -672,16 +768,36 @@ class Bidder:
     def run(self) -> list[BidChange]:
         logger.info(f"Старт биддера. {self.settings.describe()}")
 
+        # Проверка лимитов API перед началом работы
+        is_near_limit, units_rest = self.client.check_units_limit()
+        if is_near_limit:
+            logger.warning(f"Близко к лимиту API: осталось {units_rest} единиц из {self.client.last_units.get('Units-Limit')}")
+
         try:
             resp = self.client.check_campaigns()
             logger.info(f"Changes.checkCampaigns → Timestamp={resp.get('result', {}).get('Timestamp')}")
         except DirectApiError as exc:
-            if exc.is_auth_error:
+            if exc.is_rate_limit_error:
+                retry_after = exc.retry_after
+                if retry_after:
+                    logger.warning(f"Превышен лимит запросов. Ожидание {retry_after} секунд...")
+                    import time
+                    time.sleep(retry_after)
+                    # Повторная попытка после ожидания
+                    try:
+                        resp = self.client.check_campaigns()
+                        logger.info(f"Changes.checkCampaigns (повтор) → Timestamp={resp.get('result', {}).get('Timestamp')}")
+                    except Exception as retry_exc:
+                        logger.warning(f"Повторная checkCampaigns не удалась: {retry_exc}")
+                else:
+                    logger.warning("Превышен лимит запросов (без Retry-After)")
+            elif exc.is_auth_error:
                 logger.error(f"Авторизация не прошла: {exc}")
                 if exc.hint:
                     logger.error(f"Подсказка: {exc.hint}")
                 raise
-            logger.warning(f"checkCampaigns недоступен ({exc}); продолжаем без кэша")
+            else:
+                logger.warning(f"checkCampaigns недоступен ({exc}); продолжаем без кэша")
         except requests.RequestException as exc:
             logger.warning(f"checkCampaigns: сетевая ошибка ({exc}); продолжаем без кэша")
 
@@ -695,7 +811,7 @@ class Bidder:
         try:
             auction_prices = self.client.get_auction_prices(keyword_ids)
         except DirectApiError as exc:
-            if exc.is_auth_error:
+            if exc.is_auth_error or exc.is_rate_limit_error:
                 raise
             logger.warning(f"Не удалось получить цены аукциона ({exc}); используем None")
             auction_prices = {kw: None for kw in keyword_ids}
@@ -768,7 +884,10 @@ class Bidder:
 
             if entry is not None and old_rub is not None and old_rub >= entry:
                 won += 1
-            if entry is not None and old_rub is not None and old_rub >= limits.max_bid < entry:
+            # Исправлена логическая ошибка: старое условие было всегда ложным
+            # Было: old_rub >= limits.max_bid < entry (цепочка сравнений)
+            # Стало: old_rub >= limits.max_bid и old_rub < entry
+            if entry is not None and old_rub is not None and old_rub >= limits.max_bid and old_rub < entry:
                 stuck += 1
 
             if new_rub is None or old_micro == int(new_rub * BID_MULTIPLIER):
